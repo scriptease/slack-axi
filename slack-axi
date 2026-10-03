@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""slack-axi — agent-optimized Slack Web API client (AXI pattern).
+
+Acts as the signed-in user via a user token (xoxp) of an internal Slack app
+(see app_manifest.json). Token from $SLACK_TOKEN or the macOS Keychain.
+"""
+
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+
+API = "https://slack.com/api/"
+WORKSPACE = os.environ.get("SLACK_WORKSPACE", "default")
+KEYCHAIN_SERVICE = "slack-axi"
+CACHE_DIR = os.path.expanduser(f"~/.cache/slack-axi/{WORKSPACE}")
+CACHE_TTL = 86400
+
+HELP = """slack-axi — Slack for agents, as you. Data on stdout, errors on stderr.
+
+usage: slack-axi <command> [args]
+
+  login                          store a user token (xoxp) in the Keychain (prompted, or piped on stdin)
+  whoami                         user, team and granted scopes of the token
+  channels [pattern]             your channels, groups and DMs (cached 1d; --refresh)
+  users [pattern]                workspace members (cached 1d; --refresh)
+  read <channel>                 messages, oldest first (--limit N, default 30 | --since 2d|2026-10-01 | --full)
+  thread <channel> <ts> | <url>  a thread with all replies (--full)
+  search <query>                 search.messages, newest first (--limit N, default 20)
+  post <channel> <text|->        send a message, '-' reads stdin (--thread ts)
+  upload <channel> <file>        upload a file (--comment text | --thread ts)
+  download <fileId>              save an attachment (--out dir, default ~/Downloads)
+  raw <method> [k=v ...]         call any Web API method, print the JSON
+
+<channel> = id, #name, name, @user (DM) or a message permalink.
+Workspace: $SLACK_WORKSPACE selects the Keychain entry (default "default").
+"""
+
+
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------- auth ----------
+
+def keychain_token():
+    p = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", WORKSPACE, "-w"],
+                       capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+_TOKEN = None
+
+
+def token():
+    global _TOKEN
+    _TOKEN = _TOKEN or os.environ.get("SLACK_TOKEN") or keychain_token()
+    if not _TOKEN:
+        die(f"no token for workspace '{WORKSPACE}' — run: slack-axi login")
+    return _TOKEN
+
+
+def call(method, params=None, tok=None):
+    data = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None}).encode()
+    req = urllib.request.Request(API + method, data=data,
+                                 headers={"Authorization": f"Bearer {tok or token()}"})
+    for _ in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                d = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(int(e.headers.get("Retry-After", "5")))
+                continue
+            die(f"HTTP {e.code} {method}: {e.reason}")
+        except urllib.error.URLError as e:
+            die(f"network: {e.reason}")
+    else:
+        die(f"{method}: rate limited")
+    if not d.get("ok"):
+        err = d.get("error")
+        if err == "missing_scope":
+            err += f" (needs {d.get('needed')}, token has {d.get('provided')})"
+        die(f"{method}: {err}")
+    return d
+
+
+def call_all(method, params, key):
+    params, items = dict(params, limit=200), []
+    while True:
+        d = call(method, params)
+        items += d.get(key, [])
+        cursor = d.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            return items
+        params["cursor"] = cursor
+
+
+# ---------- helpers ----------
+
+def parse_flags(argv, spec):
+    """spec: name -> True (takes value) | False (boolean)."""
+    pos, flags, i = [], {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            name = a[2:]
+            if name not in spec:
+                die(f"unknown flag {a}")
+            if spec[name]:
+                if i + 1 >= len(argv):
+                    die(f"{a} needs a value")
+                flags[name] = argv[i + 1]
+                i += 1
+            else:
+                flags[name] = True
+        else:
+            pos.append(a)
+        i += 1
+    return pos, flags
+
+
+def cell(v):
+    s = "" if v is None else str(v)
+    s = s.replace("\n", " ⏎ ").strip()
+    return f'"{s}"' if "," in s else s
+
+
+def table(name, fields, rows, suffix=""):
+    print(f"{name}[{len(rows)}]{{{','.join(fields)}}}{suffix}:")
+    for r in rows:
+        print("  " + ",".join(cell(x) for x in r))
+
+
+def cached(name, fetch, refresh=False):
+    path = os.path.join(CACHE_DIR, f"{name}.json")
+    if not refresh and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
+        with open(path) as f:
+            return json.load(f)
+    items = fetch()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(items, f)
+    return items
+
+
+def load_users(refresh=False):
+    def fetch():
+        return [{"id": u["id"], "name": u["name"],
+                 "display": u.get("profile", {}).get("display_name") or u.get("real_name") or u["name"],
+                 "deleted": u.get("deleted", False), "bot": u.get("is_bot", False)}
+                for u in call_all("users.list", {}, "members")]
+    return cached("users", fetch, refresh)
+
+
+_USERS = None
+
+
+def user_name(uid):
+    global _USERS
+    if not uid:
+        return ""
+    _USERS = _USERS or {u["id"]: u["display"] for u in load_users()}
+    return _USERS.get(uid, uid)
+
+
+def load_channels(refresh=False):
+    def fetch():
+        return [{"id": c["id"], "name": c.get("name") or "", "user": c.get("user"),
+                 "type": "im" if c.get("is_im") else "mpim" if c.get("is_mpim")
+                 else "private" if c.get("is_private") else "public"}
+                for c in call_all("users.conversations",
+                                  {"types": "public_channel,private_channel,mpim,im",
+                                   "exclude_archived": "true"}, "channels")]
+    return cached("channels", fetch, refresh)
+
+
+def channel_label(c):
+    return "@" + user_name(c["user"]) if c["type"] == "im" else "#" + c["name"]
+
+
+PERMALINK_RE = re.compile(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})(?:\?.*thread_ts=([\d.]+))?")
+
+
+def parse_permalink(s):
+    """Message URL -> (channel, ts, thread_ts) or None."""
+    m = PERMALINK_RE.search(s)
+    return (m.group(1), f"{m.group(2)}.{m.group(3)}", m.group(4)) if m else None
+
+
+def resolve_channel(q):
+    link = parse_permalink(q)
+    if link:
+        return link[0]
+    if re.fullmatch(r"[CGD][A-Z0-9]{6,}", q):
+        return q
+    if q.startswith("@"):
+        name = q[1:].lower()
+        hit = [u for u in load_users() if not u["deleted"] and name in (u["name"].lower(), u["display"].lower())]
+        if len(hit) != 1:
+            die(f"no unique user '{q}' — try: slack-axi users {q[1:]}")
+        return call("conversations.open", {"users": hit[0]["id"]})["channel"]["id"]
+    name = q.lstrip("#").lower()
+    chans = load_channels()
+    hit = [c for c in chans if c["name"].lower() == name] or [c for c in chans if name in c["name"].lower()]
+    if len(hit) == 1:
+        return hit[0]["id"]
+    if not hit:
+        die(f"no channel matches '{q}' — try: slack-axi channels --refresh")
+    table("candidates", ["id", "channel"], [[c["id"], channel_label(c)] for c in hit])
+    die(f"'{q}' is ambiguous, pass the id", 2)
+
+
+def when(ts):
+    return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+
+
+def since_ts(s):
+    m = re.fullmatch(r"(\d+)([hdw])", s)
+    if m:
+        unit = {"h": "hours", "d": "days", "w": "weeks"}[m.group(2)]
+        return str((datetime.now() - timedelta(**{unit: int(m.group(1))})).timestamp())
+    try:
+        return str(datetime.fromisoformat(s).timestamp())
+    except ValueError:
+        die(f"--since: expected 2d, 12h, 1w or YYYY-MM-DD, got '{s}'")
+
+
+MENTION_RE = re.compile(r"<([@#!])([A-Z0-9]+|[a-z]+)(?:\|([^>]*))?>")
+LINK_RE = re.compile(r"<(https?://[^|>]+)(?:\|([^>]*))?>")
+
+
+def render(text):
+    def mention(m):
+        kind, ident, label = m.groups()
+        if kind == "@":
+            return "@" + user_name(ident)
+        if kind == "#":
+            return "#" + (label or ident)
+        return "@" + (label or ident)
+    text = MENTION_RE.sub(mention, text or "")
+    text = LINK_RE.sub(lambda m: f"{m.group(2)} ({m.group(1)})" if m.group(2) else m.group(1), text)
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def message_row(m, full):
+    text = render(m.get("text"))
+    if not full and len(text) > 400:
+        text = text[:400] + "…"
+    files = " ".join(f"{f['id']}:{f.get('name', '')}" for f in m.get("files", []))
+    return [m["ts"], when(m["ts"]), user_name(m.get("user")) or m.get("username") or m.get("bot_id", ""),
+            m.get("reply_count", ""), files, text]
+
+
+MESSAGE_FIELDS = ["ts", "time", "user", "replies", "files", "text"]
+
+
+# ---------- commands ----------
+
+def cmd_login(argv):
+    tok = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("User OAuth Token (xoxp-…): ")
+    if not tok.startswith("xoxp-"):
+        die("expected a user token starting with xoxp-")
+    d = call("auth.test", tok=tok)
+    subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", WORKSPACE,
+                    "-w", tok], check=True)
+    print(f"stored token for {d['user']} @ {d['team']} ({d['url']}) as workspace '{WORKSPACE}'")
+
+
+def cmd_whoami(argv):
+    req = urllib.request.Request(API + "auth.test", data=b"", headers={"Authorization": f"Bearer {token()}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        scopes = r.headers.get("x-oauth-scopes", "")
+        d = json.load(r)
+    if not d.get("ok"):
+        die(f"auth.test: {d.get('error')}")
+    print(f"user: {d['user']} ({d['user_id']})\nteam: {d['team']} ({d['team_id']}) {d['url']}")
+    print(f"scopes: {scopes}")
+
+
+def cmd_channels(argv):
+    pos, flags = parse_flags(argv, {"refresh": False})
+    chans = load_channels(flags.get("refresh", False))
+    rows = [[c["id"], c["type"], channel_label(c)] for c in chans]
+    if pos:
+        ql = pos[0].lower().lstrip("#@")
+        rows = [r for r in rows if ql in r[2].lower()]
+    table("channels", ["id", "type", "channel"], sorted(rows, key=lambda r: (r[1], r[2].lower())))
+    if rows:
+        print("→ slack-axi read <id|#name>")
+
+
+def cmd_users(argv):
+    pos, flags = parse_flags(argv, {"refresh": False})
+    users = [u for u in load_users(flags.get("refresh", False)) if not u["deleted"]]
+    if pos:
+        ql = pos[0].lower().lstrip("@")
+        users = [u for u in users if ql in u["name"].lower() or ql in u["display"].lower()]
+    table("users", ["id", "name", "display", "bot"], [[u["id"], u["name"], u["display"], u["bot"] or ""] for u in users])
+
+
+def cmd_read(argv):
+    pos, flags = parse_flags(argv, {"limit": True, "since": True, "full": False})
+    if not pos:
+        die("usage: read <channel> [--limit N] [--since 2d] [--full]")
+    cid = resolve_channel(pos[0])
+    d = call("conversations.history", {"channel": cid, "limit": int(flags.get("limit", 30)),
+                                       "oldest": since_ts(flags["since"]) if "since" in flags else None})
+    msgs = list(reversed(d.get("messages", [])))
+    table("messages", MESSAGE_FIELDS, [message_row(m, flags.get("full")) for m in msgs], f" {pos[0]}")
+    if d.get("has_more"):
+        print("  … older messages exist (--limit N | --since)")
+    if any(m.get("reply_count") for m in msgs):
+        print(f"→ slack-axi thread {cid} <ts>")
+
+
+def cmd_thread(argv):
+    pos, flags = parse_flags(argv, {"full": False})
+    link = parse_permalink(pos[0]) if pos else None
+    if link:
+        cid, ts = link[0], link[2] or link[1]
+    elif len(pos) == 2:
+        cid, ts = resolve_channel(pos[0]), pos[1]
+    else:
+        die("usage: thread <channel> <ts> | thread <permalink>")
+    msgs = call_all("conversations.replies", {"channel": cid, "ts": ts}, "messages")
+    table("thread", MESSAGE_FIELDS, [message_row(m, flags.get("full")) for m in msgs], f" {cid}/{ts}")
+
+
+def cmd_search(argv):
+    pos, flags = parse_flags(argv, {"limit": True})
+    if not pos:
+        die("usage: search <query> [--limit N]")
+    d = call("search.messages", {"query": " ".join(pos), "count": int(flags.get("limit", 20)),
+                                 "sort": "timestamp", "sort_dir": "desc"})
+    matches = d.get("messages", {}).get("matches", [])
+    rows = [[("@" + user_name(m["channel"].get("user")) if m["channel"].get("is_im") else "#" + m["channel"].get("name", "")),
+             when(m["ts"]), user_name(m.get("user")) or m.get("username", ""),
+             render(m.get("text"))[:300], m.get("permalink")] for m in matches]
+    table("matches", ["channel", "time", "user", "text", "permalink"], rows,
+          f" total={d.get('messages', {}).get('total', 0)}")
+    if rows:
+        print("→ slack-axi thread <permalink>")
+
+
+def cmd_post(argv):
+    pos, flags = parse_flags(argv, {"thread": True})
+    if len(pos) < 2:
+        die("usage: post <channel> <text|-> [--thread ts]")
+    text = sys.stdin.read().rstrip("\n") if pos[1] == "-" else " ".join(pos[1:])
+    d = call("chat.postMessage", {"channel": resolve_channel(pos[0]), "text": text, "thread_ts": flags.get("thread")})
+    link = call("chat.getPermalink", {"channel": d["channel"], "message_ts": d["ts"]})["permalink"]
+    print(f"posted {d['channel']}/{d['ts']} {link}")
+
+
+def cmd_upload(argv):
+    pos, flags = parse_flags(argv, {"comment": True, "thread": True})
+    if len(pos) != 2:
+        die("usage: upload <channel> <file> [--comment text] [--thread ts]")
+    cid, path = resolve_channel(pos[0]), pos[1]
+    if not os.path.isfile(path):
+        die(f"no such file {path}")
+    up = call("files.getUploadURLExternal", {"filename": os.path.basename(path), "length": os.path.getsize(path)})
+    with open(path, "rb") as f:
+        req = urllib.request.Request(up["upload_url"], data=f.read(), method="POST",
+                                     headers={"Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        if r.status != 200:
+            die(f"upload: HTTP {r.status}")
+    d = call("files.completeUploadExternal", {"files": json.dumps([{"id": up["file_id"]}]), "channel_id": cid,
+                                              "initial_comment": flags.get("comment"),
+                                              "thread_ts": flags.get("thread")})
+    f = d["files"][0]
+    print(f"uploaded {f['id']} {f.get('name', '')} → {cid}")
+
+
+def cmd_download(argv):
+    pos, flags = parse_flags(argv, {"out": True})
+    if not pos:
+        die("usage: download <fileId> [--out dir]")
+    f = call("files.info", {"file": pos[0]})["file"]
+    url = f.get("url_private_download") or f.get("url_private")
+    if not url:
+        die(f"{pos[0]} has no downloadable content (mode={f.get('mode')})")
+    out_dir = os.path.expanduser(flags.get("out", "~/Downloads"))
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f.get("name") or pos[0])
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        if "text/html" in r.headers.get("Content-Type", "") and f.get("filetype") != "html":
+            die("got an HTML login page instead of the file — token lacks files:read?")
+        with open(path, "wb") as o:
+            o.write(r.read())
+    print(f"saved {path} ({os.path.getsize(path)} bytes, {f.get('filetype')})")
+
+
+def cmd_raw(argv):
+    if not argv:
+        die("usage: raw <method> [k=v ...]")
+    params = dict(a.split("=", 1) for a in argv[1:])
+    print(json.dumps(call(argv[0], params), indent=1))
+
+
+COMMANDS = {"login": cmd_login, "whoami": cmd_whoami, "channels": cmd_channels, "users": cmd_users,
+            "read": cmd_read, "thread": cmd_thread, "search": cmd_search, "post": cmd_post,
+            "upload": cmd_upload, "download": cmd_download, "raw": cmd_raw}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(HELP)
+        return
+    cmd = COMMANDS.get(sys.argv[1])
+    if not cmd:
+        die(f"unknown command {sys.argv[1]}\n{HELP}")
+    cmd(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

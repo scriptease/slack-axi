@@ -1,0 +1,31 @@
+{
+    "display_information": {
+        "name": "slack-axi",
+        "description": "Personal Slack CLI: read, search, post and download as the signed-in user"
+    },
+    "oauth_config": {
+        "scopes": {
+            "user": [
+                "channels:history",
+                "channels:read",
+                "groups:history",
+                "groups:read",
+                "mpim:history",
+                "mpim:read",
+                "im:history",
+                "im:read",
+                "im:write",
+                "users:read",
+                "search:read",
+                "files:read",
+                "files:write",
+                "chat:write"
+            ]
+        }
+    },
+    "settings": {
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": false,
+        "token_rotation_enabled": false
+    }
+}
