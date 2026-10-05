@@ -39,7 +39,7 @@ usage: slack-axi <command> [args]
   download <fileId>              save an attachment (--out dir, default ~/Downloads)
   raw <method> [k=v ...]         call any Web API method, print the JSON
 
-<channel> = id, #name, name, @user (DM) or a message permalink.
+<channel> = id, #name, name, @user (DM by username or display name, not user id) or a message permalink.
 Workspace: $SLACK_WORKSPACE selects the Keychain entry (default "default").
 """
 

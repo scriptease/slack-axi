@@ -81,7 +81,7 @@ slack-axi download F0123ABCD --out /tmp    # file ids appear in read/thread outp
 slack-axi raw conversations.info channel=C0123ABCD
 ```
 
-`<channel>` is an id, `#name`, `name`, `@user` (DM) or a message permalink. `slack-axi help` lists all commands and flags.
+`<channel>` is an id, `#name`, `name`, `@user` (DM by username or display name, e.g. `@jane.doe`; a `U…` user id does not work) or a message permalink. `slack-axi help` lists all commands and flags.
 
 ## Other Slack CLIs for agents
 
