@@ -42,8 +42,17 @@ The manifest only requests user scopes, no bot:
 | `files:read` | `download` |
 | `files:write` | `upload` |
 | `chat:write` | `post` |
+| `channels:write` `groups:write` | `raw conversations.join`, `raw conversations.mark` |
+| `mpim:write` | `raw conversations.open users=U1,U2` (group DM) |
+| `users:read.email` | `raw users.lookupByEmail email=…` |
+| `usergroups:read` | `raw usergroups.list` |
+| `emoji:read` | `raw emoji.list` (custom emoji names) |
+| `reactions:read` `reactions:write` | `raw reactions.get`, `raw reactions.add` |
+| `pins:write` | `raw pins.add` |
+| `reminders:write` | `raw reminders.add` |
+| `bookmarks:write` | `raw bookmarks.add` |
 
-Drop scopes you don't need before creating the app. For example, without `im:history` the app can't read your DMs. Changing scopes later requires reinstalling the app.
+Drop scopes you don't need before creating the app. For example, without `im:history` the app can't read your DMs. Changing scopes later requires reinstalling the app. Reinstalling only adds scopes: Slack keeps every scope you granted the app before, so to drop one, remove it from the app, run `slack-axi raw auth.revoke`, reinstall and `slack-axi login` again.
 
 ## 2. Log in
 
@@ -79,6 +88,7 @@ slack-axi post '#general' 'Hello'          # or: echo text | slack-axi post @use
 slack-axi upload @alex build.zip --comment 'New build'
 slack-axi download F0123ABCD --out /tmp    # file ids appear in read/thread output
 slack-axi raw conversations.info channel=C0123ABCD
+slack-axi raw reactions.add channel=C0123ABCD timestamp=1791528121.093989 name=white_check_mark
 ```
 
 `<channel>` is an id, `#name`, `name`, `@user` (DM by username or display name, e.g. `@jane.doe`; a `U…` user id does not work) or a message permalink. `slack-axi help` lists all commands and flags.
@@ -89,7 +99,7 @@ Same idea, different trade-offs. Pick the one that fits:
 
 | Project | Runtime | Auth | Writes |
 |---|---|---|---|
-| **slack-axi** (this) | single Python file, stdlib only | `xoxp`, Keychain | post, upload, download |
+| **slack-axi** (this) | single Python file, stdlib only | `xoxp`, Keychain | post, upload, download; reactions, pins, reminders via `raw` |
 | [JarvusInnovations/slack-axi](https://github.com/JarvusInnovations/slack-axi) | Node/bun, `npm install -g slack-axi` | `xoxp`, guided `auth setup` | drafts, posted only after explicit `draft send` |
 | [lucas-codes/slack-axi](https://github.com/lucas-codes/slack-axi) | Node, build with bun | `xoxp` via env | read-only, GET allowlist |
 | [cyberuni/cyber-slack](https://github.com/cyberuni/cyber-slack) | Node, `npm install -g cyber-slack` | `xoxp` or `xoxb` via env | post, reactions, user groups; also an MCP server |

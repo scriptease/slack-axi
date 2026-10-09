@@ -19,7 +19,18 @@
                 "search:read",
                 "files:read",
                 "files:write",
-                "chat:write"
+                "chat:write",
+                "channels:write",
+                "groups:write",
+                "mpim:write",
+                "users:read.email",
+                "usergroups:read",
+                "emoji:read",
+                "reactions:read",
+                "reactions:write",
+                "pins:write",
+                "reminders:write",
+                "bookmarks:write"
             ]
         }
     },
